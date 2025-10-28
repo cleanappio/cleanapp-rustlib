@@ -121,7 +121,7 @@ impl Subscriber {
     /// Starts consuming messages from the queue with the specified routing key callbacks
     pub async fn start(
         &mut self,
-        routing_key_callbacks: HashMap<String, Box<dyn Callback + Send + Sync>>,
+        routing_key_callbacks: HashMap<String, Arc<dyn Callback + Send + Sync>>,
     ) -> Result<(), SubscriberError> {
         // Create bindings for each routing key
         for routing_key in routing_key_callbacks.keys() {
@@ -169,7 +169,7 @@ impl Subscriber {
     async fn process_messages(
         &self,
         consumer: Consumer,
-        routing_key_callbacks: HashMap<String, Box<dyn Callback + Send + Sync>>,
+        routing_key_callbacks: HashMap<String, Arc<dyn Callback + Send + Sync>>,
     ) {
         let callbacks = Arc::new(routing_key_callbacks);
         let channel = self.channel.clone();
