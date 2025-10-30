@@ -1,6 +1,6 @@
 use lapin::{
-    options::*, types::FieldTable, Channel, Connection, ConnectionProperties, Consumer,
-    ExchangeKind,
+    Channel, Connection, ConnectionProperties, Consumer, ExchangeKind, options::*,
+    types::FieldTable,
 };
 use serde::de::DeserializeOwned;
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -45,7 +45,7 @@ impl Message {
     }
 }
 
-pub trait Callback  {
+pub trait Callback {
     fn on_message(&self, message: &Message) -> Result<(), Box<dyn std::error::Error>>;
 }
 
@@ -121,7 +121,7 @@ impl Subscriber {
     /// Starts consuming messages from the queue with the specified routing key callbacks
     pub async fn start(
         &mut self,
-        routing_key_callbacks: HashMap<String, Arc<dyn Callback>>,
+        routing_key_callbacks: HashMap<String, Arc<dyn Callback + Send + Sync>>,
     ) -> Result<(), SubscriberError> {
         // Create bindings for each routing key
         for routing_key in routing_key_callbacks.keys() {
@@ -169,69 +169,49 @@ impl Subscriber {
     async fn process_messages(
         &self,
         consumer: Consumer,
-        routing_key_callbacks: HashMap<String, Arc<dyn Callback>>,
+        routing_key_callbacks: HashMap<String, Arc<dyn Callback + Send + Sync>>,
     ) {
         let callbacks = Arc::new(routing_key_callbacks);
         let channel = self.channel.clone();
 
-        use futures_util::stream::StreamExt;
-        use futures_util::TryStreamExt;
+        tokio::spawn(async move {
+            use futures_util::stream::StreamExt;
 
-        let mut stream = consumer.into_stream();
-
-        while let Some(delivery) = stream.next().await {
-            match delivery {
-                Ok(delivery) => {
-                    // Create message wrapper
-                    let msg = Message {
-                        body: delivery.data,
-                        routing_key: delivery.routing_key.to_string(),
-                        exchange: delivery.exchange.to_string(),
-                        content_type: delivery.properties.content_type().as_ref().map(|s| s.to_string()),
+            let mut message_stream = consumer;
+            while let Some(delivery) = message_stream.next().await {
+                if let Ok(delivery) = delivery {
+                    let routing_key = delivery.routing_key.clone();
+                    let message = Message {
+                        body: delivery.data.clone(),
+                        routing_key: delivery.routing_key.clone().to_string(),
+                        exchange: delivery.exchange.clone().to_string(),
+                        content_type: delivery
+                            .properties
+                            .content_type()
+                            .as_ref()
+                            .map(|s| s.to_string()),
                         timestamp: delivery.properties.timestamp().as_ref().copied(),
                         delivery_tag: delivery.delivery_tag,
                     };
 
-                    // Find callback for this routing key
-                    if let Some(callback) = callbacks.get(&msg.routing_key) {
-                        // Process message
-                        match callback.on_message(&msg) {
-                            Ok(_) => {
-                                // Acknowledge message after successful processing
-                                if let Err(e) = channel
-                                    .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
-                                    .await
-                                {
-                                    log::error!("Failed to acknowledge message for routing key {}: {}", msg.routing_key, e);
-                                }
-                            }
-                            Err(e) => {
-                                log::error!("Error processing message for routing key {}: {}", msg.routing_key, e);
-                                // Reject message on error
-                                if let Err(ack_err) = channel
-                                    .basic_nack(delivery.delivery_tag, BasicNackOptions::default())
-                                    .await
-                                {
-                                    log::error!("Failed to nack message for routing key {}: {}", msg.routing_key, ack_err);
-                                }
-                            }
+                    if let Some(callback) = callbacks.get(&message.routing_key) {
+                        if let Err(e) = callback.on_message(&message) {
+                            eprintln!("Error processing message: {}", e);
                         }
                     } else {
-                        log::warn!("No callback found for routing key: {}", msg.routing_key);
-                        // Reject message if no callback found
-                        if let Err(e) = channel
-                            .basic_nack(delivery.delivery_tag, BasicNackOptions::default())
-                            .await
-                        {
-                            log::error!("Failed to nack message for routing key {}: {}", msg.routing_key, e);
-                        }
+                        eprintln!("No callback found for routing key: {}", routing_key);
+                    }
+
+                    // Acknowledge the message
+                    if let Err(e) = channel
+                        .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
+                        .await
+                    {
+                        eprintln!("Failed to acknowledge message: {}", e);
                     }
                 }
-                Err(e) => {
-                    log::error!("Error receiving delivery: {}", e);
-                }
             }
-        }
+        });
     }
 
     /// Checks if the subscriber is still connected
